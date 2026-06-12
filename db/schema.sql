@@ -108,3 +108,16 @@ insert into public.teams (name, code, flag, group_name) values
 on conflict (code) do nothing;
 
 -- No seed matches — run the sync (npm run sync) to load all 104 real fixtures.
+
+-- =====================================================================
+-- USER PREFERENCES (timezone) — additive change
+-- =====================================================================
+create table if not exists public.user_preferences (
+  user_id    uuid primary key references auth.users(id) on delete cascade,
+  timezone   text not null default 'UTC',
+  updated_at timestamptz default now()
+);
+alter table public.user_preferences enable row level security;
+drop policy if exists "own_prefs" on public.user_preferences;
+create policy "own_prefs" on public.user_preferences
+  for all to authenticated using (auth.uid() = user_id) with check (auth.uid() = user_id);

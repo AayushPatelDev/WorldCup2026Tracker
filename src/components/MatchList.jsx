@@ -1,7 +1,9 @@
 import MatchCard from './MatchCard.jsx';
-import { fmtDay, groupByDay } from '../lib/helpers.js';
+import { useApp } from '../lib/ctx.js';
+import { groupByDay, fmtDateKey } from '../lib/helpers.js';
 
-export default function MatchList({ matches, followed, toggleTeam, emptyTitle, emptyBody }) {
+export default function MatchList({ matches, emptyTitle, emptyBody }) {
+  const { tz } = useApp();
   if (!matches.length) {
     return (
       <div className="empty">
@@ -12,16 +14,16 @@ export default function MatchList({ matches, followed, toggleTeam, emptyTitle, e
   }
   return (
     <div>
-      {groupByDay(matches).map(([k, items]) => (
+      {groupByDay(matches, tz).map(([k, items]) => (
         <div className="day-group" key={k}>
           <div className="day-label">
-            {fmtDay(k)}
-            <span className="cnt">
+            {fmtDateKey(k)}
+            <span className="day-count mono">
               {items.length} match{items.length > 1 ? 'es' : ''}
             </span>
           </div>
           {items.map(m => (
-            <MatchCard key={m.id} m={m} followed={followed} toggleTeam={toggleTeam} />
+            <MatchCard key={m.id} m={m} />
           ))}
         </div>
       ))}

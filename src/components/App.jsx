@@ -1,22 +1,43 @@
-import { useState, useEffect, useCallback, useMemo } from 'react';
+import { useState, useEffect, useCallback, useMemo, useRef } from 'react';
 import { db, configured } from '../lib/supabase.js';
-import { icsEvent, downloadICS, tzName } from '../lib/helpers.js';
+import { detectedTz } from '../lib/helpers.js';
+import { AppCtx } from '../lib/ctx.js';
+import { computeStandings } from '../lib/standings.js';
 import Auth from './Auth.jsx';
-import Flag from './Flag.jsx';
-import MatchList from './MatchList.jsx';
-import Timetable from './Timetable.jsx';
+import Header from './Header.jsx';
+import Home from './Home.jsx';
+import Schedule from './Schedule.jsx';
+import Favourites from './Favourites.jsx';
 import Teams from './Teams.jsx';
+import MatchDetail from './MatchDetail.jsx';
+import TeamDrawer from './TeamDrawer.jsx';
+import GoalAnimation from './GoalAnimation.jsx';
+import WinnerAnimation from './WinnerAnimation.jsx';
+import SettingsModal from './SettingsModal.jsx';
+import Trophy from './Trophy.jsx';
 
 export default function App() {
   const [user, setUser] = useState(null);
   const [teams, setTeams] = useState([]);
   const [followed, setFollowed] = useState(new Set());
   const [matches, setMatches] = useState([]); // ALL matches
-  const [tab, setTab] = useState('all');
   const [loading, setLoading] = useState(true);
-  const [groupFilter, setGroupFilter] = useState('all');
-  const [statusFilter, setStatusFilter] = useState('all');
+  const [page, setPage] = useState('home');
+  const [onboarding, setOnboarding] = useState(false);
 
+  // timezone preference
+  const [tz, setTzState] = useState(detectedTz);
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  const [firstRunTz, setFirstRunTz] = useState(false);
+
+  // drawers + celebration overlays
+  const [detailId, setDetailId] = useState(null);
+  const [teamId, setTeamId] = useState(null);
+  const [goalEvent, setGoalEvent] = useState(null);
+  const [winEvent, setWinEvent] = useState(null);
+  const [goalFlash, setGoalFlash] = useState(() => new Map());
+
+  // ---------- auth (unchanged data logic) ----------
   useEffect(() => {
     if (!configured) {
       setLoading(false);
@@ -30,6 +51,7 @@ export default function App() {
     return () => sub.subscription.unsubscribe();
   }, []);
 
+  // ---------- data loading (unchanged data logic) ----------
   const loadBase = useCallback(async () => {
     const { data: t } = await db.from('teams').select('*').order('group_name').order('name');
     setTeams(t || []);
@@ -41,7 +63,7 @@ export default function App() {
     const { data } = await db
       .from('matches')
       .select(
-        '*, home:home_team_id(id,name,code,flag), away:away_team_id(id,name,code,flag)'
+        '*, home:home_team_id(id,name,code,flag,group_name), away:away_team_id(id,name,code,flag,group_name)'
       )
       .order('kickoff');
     // keep matches that have at least one resolved team OR a TBD label (knockouts)
@@ -55,6 +77,7 @@ export default function App() {
     }
   }, [user, loadBase, loadMatches]);
 
+  // ---------- realtime (unchanged pattern; everything below derives from `matches`) ----------
   useEffect(() => {
     if (!user) return;
     const ch = db
@@ -64,6 +87,7 @@ export default function App() {
     return () => db.removeChannel(ch);
   }, [user, loadMatches]);
 
+  // ---------- follow / unfollow (unchanged data logic) ----------
   async function toggleTeam(id) {
     const next = new Set(followed);
     if (next.has(id)) {
@@ -76,41 +100,131 @@ export default function App() {
     setFollowed(next);
   }
 
-  const favMatches = useMemo(
-    () => matches.filter(m => (m.home && followed.has(m.home.id)) || (m.away && followed.has(m.away.id))),
-    [matches, followed]
-  );
-  const favTeams = useMemo(() => teams.filter(t => followed.has(t.id)), [teams, followed]);
-  const liveCount = matches.filter(m => m.status === 'live').length;
+  // ---------- timezone preference ----------
+  useEffect(() => {
+    if (!user || onboarding) return;
+    db.from('user_preferences')
+      .select('timezone')
+      .eq('user_id', user.id)
+      .maybeSingle()
+      .then(({ data }) => {
+        if (data?.timezone) setTzState(data.timezone);
+        else setFirstRunTz(true); // first login: confirm detected zone
+      });
+  }, [user, onboarding]);
 
-  const allGroups = useMemo(
-    () => [...new Set(teams.map(t => t.group_name).filter(Boolean))].sort(),
-    [teams]
-  );
-  const filteredAll = useMemo(
-    () =>
-      matches.filter(m => {
-        if (statusFilter !== 'all' && m.status !== statusFilter) return false;
-        if (groupFilter !== 'all' && !(m.stage || '').includes(groupFilter)) return false;
-        return true;
-      }),
-    [matches, statusFilter, groupFilter]
+  const saveTz = useCallback(
+    async z => {
+      setTzState(z);
+      setFirstRunTz(false);
+      setSettingsOpen(false);
+      if (user)
+        await db
+          .from('user_preferences')
+          .upsert({ user_id: user.id, timezone: z, updated_at: new Date().toISOString() });
+    },
+    [user]
   );
 
-  function addAllFav() {
-    if (!favMatches.length) return;
-    const upcoming = favMatches.filter(m => m.status !== 'finished');
-    downloadICS(upcoming.map(icsEvent), 'my-worldcup-2026.ics');
-  }
+  // ---------- goal & full-time detection (drives celebrations + card flashes) ----------
+  const prevMatchesRef = useRef(new Map());
+  useEffect(() => {
+    const prev = prevMatchesRef.current;
+    if (prev.size) {
+      for (const m of matches) {
+        const p = prev.get(m.id);
+        if (!p) continue;
+        const hs = m.home_score ?? 0;
+        const as = m.away_score ?? 0;
+        const phs = p.home_score ?? 0;
+        const pas = p.away_score ?? 0;
+        if (m.status !== 'scheduled' && (hs > phs || as > pas)) {
+          const side = hs > phs ? 'home' : 'away';
+          setGoalEvent({ match: m, side, key: `${m.id}-${hs}-${as}` });
+          setGoalFlash(f => new Map(f).set(m.id, { side, ts: Date.now() }));
+          setTimeout(
+            () =>
+              setGoalFlash(f => {
+                const n = new Map(f);
+                n.delete(m.id);
+                return n;
+              }),
+            5000
+          );
+        }
+        if (p.status !== 'finished' && m.status === 'finished') {
+          const mine =
+            (m.home && followed.has(m.home.id)) || (m.away && followed.has(m.away.id));
+          if (mine) setWinEvent({ match: m, key: `ft-${m.id}` });
+        }
+      }
+    }
+    prevMatchesRef.current = new Map(matches.map(m => [m.id, m]));
+  }, [matches, followed]);
 
-  if (loading) return <div className="loading">Loading…</div>;
+  // ---------- live match clock: tick client-side between server updates ----------
+  const minuteBase = useRef(new Map());
+  const [, setClockTick] = useState(0);
+  useEffect(() => {
+    const map = minuteBase.current;
+    const liveIds = new Set();
+    matches.forEach(m => {
+      if (m.status !== 'live') return;
+      liveIds.add(m.id);
+      const srv = m.minute ?? 0;
+      const b = map.get(m.id);
+      if (!b || b.server !== srv) map.set(m.id, { server: srv, ts: Date.now() }); // reset on server update
+    });
+    [...map.keys()].forEach(id => liveIds.has(id) || map.delete(id));
+  }, [matches]);
+  useEffect(() => {
+    if (!matches.some(m => m.status === 'live')) return;
+    const t = setInterval(() => setClockTick(x => x + 1), 60000);
+    return () => clearInterval(t);
+  }, [matches]);
+  const liveMinute = useCallback(m => {
+    const b = minuteBase.current.get(m.id);
+    if (!b) return m.minute ?? null;
+    return b.server + Math.floor((Date.now() - b.ts) / 60000);
+  }, []);
+
+  // ---------- derived ----------
+  const standings = useMemo(() => computeStandings(teams, matches), [teams, matches]);
+
+  const ctx = useMemo(
+    () => ({
+      tz,
+      teams,
+      matches,
+      followed,
+      standings,
+      goalFlash,
+      toggleTeam,
+      liveMinute,
+      openMatch: setDetailId,
+      openTeam: setTeamId,
+      openSettings: () => setSettingsOpen(true),
+    }),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [tz, teams, matches, followed, standings, goalFlash, liveMinute]
+  );
+
+  // ---------- render ----------
+  if (loading)
+    return (
+      <div className="loading-splash">
+        <Trophy size={48} />
+        <div className="wordmark">PITCHSIDE</div>
+        <div className="loading-sub">Warming up…</div>
+      </div>
+    );
 
   if (!configured)
     return (
       <div className="wrap">
-        <div className="auth">
-          <h2>Setup needed</h2>
-          <p>
+        <div className="auth-card setup">
+          <h2 className="auth-h">SETUP NEEDED</h2>
+          <p className="auth-p">
             Create a <b>.env</b> file with your <b>VITE_SUPABASE_URL</b> and <b>VITE_SUPABASE_ANON_KEY</b> (see
             <b> .env.example</b>), then restart the dev server. Run <b>db/schema.sql</b> in Supabase first.
           </p>
@@ -118,141 +232,40 @@ export default function App() {
       </div>
     );
 
-  if (!user)
-    return (
-      <div className="wrap">
-        <Auth onAuth={setUser} />
-      </div>
-    );
+  if (!user || onboarding) return <Auth onAuth={setUser} setOnboarding={setOnboarding} />;
+
+  const detailMatch = detailId != null ? matches.find(m => m.id === detailId) : null;
+  const drawerTeam = teamId != null ? teams.find(t => t.id === teamId) : null;
 
   return (
-    <div className="wrap">
-      <header className="top">
-        <div className="logo">
-          <div className="ball"></div>
-          <div>
-            <h1>
-              PITCH<span>SIDE</span>
-            </h1>
-            <small>WORLD CUP 2026 TRACKER</small>
-          </div>
-        </div>
-        <button className="btn btn-ghost" onClick={() => db.auth.signOut()}>
-          Sign out
-        </button>
-      </header>
+    <AppCtx.Provider value={ctx}>
+      <Header page={page} setPage={setPage} user={user} />
 
-      <div className="tabs">
-        <div className={'tab' + (tab === 'all' ? ' active' : '')} onClick={() => setTab('all')}>
-          All Matches {liveCount > 0 && <span className="dot"></span>}
-        </div>
-        <div className={'tab' + (tab === 'fav' ? ' active' : '')} onClick={() => setTab('fav')}>
-          Favourites {favTeams.length > 0 && <span className="pill">{favTeams.length}</span>}
-        </div>
-        <div className={'tab' + (tab === 'teams' ? ' active' : '')} onClick={() => setTab('teams')}>
-          Teams
-        </div>
-      </div>
+      <main key={page} className="wrap page-anim">
+        {page === 'home' && <Home />}
+        {page === 'schedule' && <Schedule />}
+        {page === 'fav' && <Favourites setPage={setPage} />}
+        {page === 'teams' && <Teams />}
+      </main>
 
-      {tab === 'all' && (
-        <div>
-          <div className="toolbar">
-            <div>
-              <div className="section-h">All matches</div>
-              <div className="section-sub">
-                Every fixture in the tournament. Tap the ★ next to any team to add it to your favourites.
-              </div>
-            </div>
-            <div className="filters">
-              <select className="grp" value={groupFilter} onChange={e => setGroupFilter(e.target.value)}>
-                <option value="all">All groups</option>
-                {allGroups.map(g => (
-                  <option key={g} value={g}>
-                    {g}
-                  </option>
-                ))}
-              </select>
-              {['all', 'live', 'scheduled', 'finished'].map(s => (
-                <span
-                  key={s}
-                  className={'chip' + (statusFilter === s ? ' on' : '')}
-                  onClick={() => setStatusFilter(s)}
-                >
-                  {s === 'all' ? 'All' : s[0].toUpperCase() + s.slice(1)}
-                </span>
-              ))}
-            </div>
-          </div>
-          <MatchList
-            matches={filteredAll}
-            followed={followed}
-            toggleTeam={toggleTeam}
-            emptyTitle="No matches to show"
-            emptyBody="Run the sync to load the World Cup 2026 fixtures, or adjust your filters."
-          />
-        </div>
+      {detailMatch && <MatchDetail match={detailMatch} onClose={() => setDetailId(null)} />}
+      {drawerTeam && <TeamDrawer team={drawerTeam} onClose={() => setTeamId(null)} />}
+
+      {goalEvent && (
+        <GoalAnimation key={goalEvent.key} event={goalEvent} onDone={() => setGoalEvent(null)} />
+      )}
+      {winEvent && !goalEvent && (
+        <WinnerAnimation key={winEvent.key} event={winEvent} onDone={() => setWinEvent(null)} />
       )}
 
-      {tab === 'fav' && (
-        <div>
-          <div className="section-h">Your favourites</div>
-          <div className="section-sub">
-            Everything for the teams you follow — all in one place. Add the whole schedule to your own calendar
-            with one click.
-          </div>
-
-          {favTeams.length === 0 ? (
-            <div className="empty">
-              <div className="big">No favourite teams yet</div>
-              <div>Head to the Teams tab (or tap a ★ on any match) to start following.</div>
-            </div>
-          ) : (
-            <>
-              <div className="fav-teams">
-                {favTeams.map(t => (
-                  <div className="fav-team" key={t.id}>
-                    <Flag src={t.flag} size={18} /> {t.name}
-                    <span className="x" title="Remove" onClick={() => toggleTeam(t.id)}>
-                      ×
-                    </span>
-                  </div>
-                ))}
-              </div>
-
-              <div className="toolbar">
-                <div className="section-h" style={{ fontSize: '20px' }}>
-                  Upcoming & live
-                </div>
-                <button className="btn btn-grass" onClick={addAllFav}>
-                  ＋ Add all to my calendar
-                </button>
-              </div>
-              <MatchList
-                matches={favMatches}
-                followed={followed}
-                toggleTeam={toggleTeam}
-                emptyTitle="No matches scheduled yet"
-                emptyBody="Fixtures will appear here as they're confirmed."
-              />
-
-              <div className="tt-head">
-                <div>
-                  <div className="section-h" style={{ fontSize: '20px' }}>
-                    Timetable
-                  </div>
-                  <div className="tz-note">Times shown in your local zone · {tzName}</div>
-                </div>
-                <button className="btn btn-ghost" onClick={addAllFav}>
-                  Export .ics
-                </button>
-              </div>
-              <Timetable matches={favMatches} />
-            </>
-          )}
-        </div>
+      {(settingsOpen || firstRunTz) && (
+        <SettingsModal
+          tz={tz}
+          firstRun={firstRunTz && !settingsOpen}
+          onSave={saveTz}
+          onClose={() => setSettingsOpen(false)}
+        />
       )}
-
-      {tab === 'teams' && <Teams teams={teams} followed={followed} toggleTeam={toggleTeam} />}
-    </div>
+    </AppCtx.Provider>
   );
 }
